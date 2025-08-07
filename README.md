@@ -7,8 +7,9 @@ by Maximilian Laiacker 2020
 post@mlaiacker.de
 
 with contributions from
+David Silva 2025,
 Abel Gabor 2019,
-Bey Hao Yun 2024
+Bey Hao Yun 2024,
 baquatelle@gmail.com,
 beyhy94@gmail.com
 a.j.blight@leeds.ac.uk
@@ -43,10 +44,12 @@ docker build -f Dockerfile.ros2 -t rosbag2video:humble .
 ## **Usage**
 
 ``` bash
-rosbag2video [-h] [-v] [-r RATE] -t TOPIC -i IFILE [-o OFILE] [--save_images]
-                    [--frames FRAMES]
+usage: rosbag2video [-h] [-v] [-r RATE] [-t TOPIC] [-o OFILE] [--save_images] [--frames FRAMES] rosbag [rosbag ...]
 
 Convert ROS bag (1/2) to video using ffmpeg.
+
+positional arguments:
+  rosbag                Input File
 
 options:
   -h, --help            show this help message and exit
@@ -54,8 +57,6 @@ options:
   -r RATE, --rate RATE  Video framerate
   -t TOPIC, --topic TOPIC
                         Topic Name
-  -i IFILE, --ifile IFILE
-                        Input File
   -o OFILE, --ofile OFILE
                         Output File
   --save_images         Boolean flag for saving extracted .png frames in frames/
@@ -94,6 +95,6 @@ source /opt/ros/humble/setup.bash
 ```
 
 ```bash
-python3 rosbag2video.py -t <topic_name> -i <bag_folder_name> -o <output_video_file_name>
+python3 rosbag2video.py -t <topic_name> -o <output_video_file_name> <bag_folder_name>
 # Eg. python3 rosbag2video.py -t /cam0/image_raw -i rosbag2_2024_10_11-19_45_28 -o myvideo.mp4
 ```
