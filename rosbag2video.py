@@ -90,7 +90,7 @@ def get_pix_fmt(msg_encoding: str) -> str:
             "[ERROR] - Could not handle this format."
             + " Maybe thoera packet? theora is not supported."
         )
-        sys.exit(1)
+        return ""
     if IS_VERBOSE:
         print("[INFO] - pix_fmt:", pix_fmt)
     return pix_fmt
@@ -109,9 +109,9 @@ def get_msg_format_from_rosbag(reader: AnyReader, connection: Connection) -> str
     try:
         _, _, raw = next(reader.messages(connections=[connection]))
     except StopIteration:
-        return ""
+        return "", None
     msg = reader.deserialize(raw, connection.msgtype)
-    return getattr(msg, "format", getattr(msg, "encoding", ""))
+    return getattr(msg, "format", getattr(msg, "encoding", "")), msg
 
 try:
 # this needs cv_bridge
@@ -331,17 +331,24 @@ def create_video_from_jpg(
         output_video,
         "-y",
     ]
+    create_video_ffmpeg(cmd, reader, connection, output_video, max_frames)
+
+def create_video_ffmpeg(
+    cmd: str,
+    reader: AnyReader,
+    connection: Connection,
+    output_video: str,
+    max_frames: int = -1,
+):
     if IS_VERBOSE:
         print("[INFO] -", " ".join(cmd))
-
     ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
         if 0 < max_frames <= i:
             break
-        ffmpeg.stdin.write(raw)  # raw is already JPEG bytes
-        if IS_VERBOSE:
-            print(f"[INFO] - Streaming frame {i+1}", end="\r")
+        msg = reader.deserialize(raw, connection.msgtype)
+        ffmpeg.stdin.write(msg.data)  # raw from rosbag
     ffmpeg.stdin.close()
     ffmpeg.wait()
     print(f"[INFO] - Video written to {output_video}.")
@@ -350,14 +357,19 @@ def export_all_image_topics(
     bag_path: Path,
     args:argparse.ArgumentParser
 ):
-        # Process the bag
+    # Process the bag
     with AnyReader([bag_path]) as reader:
         for c in reader.connections:
             message_count, msg_type, conn = get_topic_info(reader, c.topic)
-            msg_encoding = get_msg_format_from_rosbag(reader, conn)
+            msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
+            if bag_path.is_file() :
+                ofile = bag_path.with_name(bag_path.stem + c.topic.replace("/","_")+".mp4")
+            elif bag_path.is_dir() :
+                ofile = bag_path / (c.topic.replace("/","_")+".mp4")
+            if(ofile.exists()):
+                continue
             if (
                 msg_type.endswith("CompressedImage")
-                and not args.save_images
                 and ("jpeg" in msg_encoding.lower() or "jpg" in msg_encoding.lower())
             ):
                 if IS_VERBOSE:
@@ -365,13 +377,36 @@ def export_all_image_topics(
                         print(f"{c.topic} msg_type: {msg_type} msg_encoding: {msg_encoding}")
                     except:
                         pass
-                ofile = bag_path / (c.topic.replace("/","_")+".mp4")
-                if(not ofile.exists()):
+                print(f"exporting {c.topic} to file {ofile}" )
+                # we can directly feed the jpg data to ffmpeg to create the video
+                create_video_from_jpg(reader, conn, str(ofile), args.rate)
+            elif (
+                msg_type.endswith("sensor_msgs/msg/Image")
+                and msg_encoding != ""
+            ):
+                try:
+                    size = str(msg.width)+"x"+str(msg.height)
+                    pix_fmt = get_pix_fmt(msg_encoding)
+                    cmd = [
+                        "ffmpeg",
+                        "-loglevel",
+                        "error" if not IS_VERBOSE else "info",
+                        "-stats",
+                        "-r",
+                        str(args.rate),
+                        "-f", "rawvideo",
+                        "-s", size,
+                        "-pix_fmt", pix_fmt,
+                        "-i", "-",  # stdin
+                        "-c:v", "mjpeg",
+                        "-an",
+                        str(ofile),
+                        "-y",
+                    ]
                     print(f"exporting {c.topic} to file {ofile}" )
-                    # we can directly feed the jpg data to ffmpeg to create the video
-                    create_video_from_jpg(reader, conn, str(ofile), args.rate)
-
-            
+                    create_video_ffmpeg(cmd, reader, conn, str(ofile))
+                except Exception as e:
+                    print(f"failed exporting {c.topic} to file {ofile} with error:", e )
 
 
 if __name__ == "__main__":
@@ -423,7 +458,7 @@ if __name__ == "__main__":
         with AnyReader([bag_path]) as reader:
             message_count, msg_type, conn = get_topic_info(reader, args.topic)
 
-            msg_encoding = get_msg_format_from_rosbag(reader, conn)
+            msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
             if (
                 msg_type.endswith("CompressedImage")
                 and not args.save_images
@@ -447,3 +482,4 @@ if __name__ == "__main__":
                 # Keep or remove frames folder content based on --save-images flag.
                 if not args.save_images:
                     clear_folder_if_non_empty(FRAMES_FOLDER)
+
