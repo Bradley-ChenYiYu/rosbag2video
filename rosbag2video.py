@@ -114,7 +114,8 @@ def get_msg_format_from_rosbag(reader: AnyReader, connection: Connection) -> str
     return getattr(msg, "format", getattr(msg, "encoding", ""))
 
 try:
-
+# this needs cv_bridge
+# the rest will not need it so we can still extract using ffmpeg
     def save_image_from_rosbag(
         cvbridge: CvBridge,
         reader: AnyReader,
@@ -143,8 +144,10 @@ try:
             deserializes them into OpenCV images, and saves them as PNG files.
         """
         for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
-            if i != message_index:
-                continue
+
+            print(f"[INFO] - Extracting [{i+1}/{message_count}] …", end="\r")
+            sys.stdout.flush()
+
             msg = reader.deserialize(raw, connection.msgtype)
             image_file_type = ".jpg" if getattr(msg, "format", "").lower() == "jpeg" else ".png"
 
@@ -153,12 +156,13 @@ try:
             else:
                 cv_image = cvbridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
 
-            padded_number = f"{message_index:07d}"
+            padded_number = f"{i:07d}"
             output_filename = f"frames/{padded_number}{image_file_type}"
             cv2.imwrite(output_filename, cv_image)
-            break
+            
         else:
             print(f"[ERROR] - No message at index {message_index} for topic {conn.topic}")
+
 except:
     pass
 
@@ -434,10 +438,7 @@ if __name__ == "__main__":
                 clear_folder_if_non_empty(FRAMES_FOLDER)
 
                 bridge = CvBridge()
-                for i in range(message_count if args.frames < 0 else min(message_count, args.frames)):
-                    save_image_from_rosbag(bridge, reader, conn, msg_type, i)
-                    print(f"[INFO] - Extracting [{i+1}/{message_count}] …", end="\r")
-                    sys.stdout.flush()
+                save_image_from_rosbag(bridge, reader, conn, msg_type)
                 # Construct video from image sequence
                 pix_fmt = get_pix_fmt(msg_encoding)
                 if not create_video_from_images(FRAMES_FOLDER, args.ofile, pix_fmt, framerate=args.rate):
