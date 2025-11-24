@@ -3,7 +3,7 @@
 ```text
 rosbag2video.py
 rosbag to video file conversion tool
-by Maximilian Laiacker 2020
+by Maximilian Laiacker 2025
 post@mlaiacker.de
 
 with contributions from
@@ -21,6 +21,8 @@ Build docker images using the commands below:
 
 1. Download `rosbag2video`:
 
+install python3
+
 ```bash
 cd $HOME
 ```
@@ -28,6 +30,22 @@ cd $HOME
 ```bash
 git clone https://github.com/mlaiacker/rosbag2video
 ```
+
+install dependencies
+
+```bash
+sudo apt install ffmpeg
+pip install rosbags
+pip install opencv-python
+```
+
+Mostly tested with bags containing 
+```bash
+msg_type: sensor_msgs/msg/CompressedImage msg_encoding: jpeg
+```
+
+
+Or use docker if you want to:
 
 2. Build docker image for running ROS 1 `rosbag2video.py`:
 
@@ -43,13 +61,16 @@ docker build -f Dockerfile.ros2 -t rosbag2video:humble .
 
 ## **Usage**
 
+By default it will extract all compressed image topics inside the bag directory with the name of <topic>.mp4 ('/' inside the topic name will be replaced by '_') as mjpeg encoded video with 30fps.
+
+
 ``` bash
 usage: rosbag2video [-h] [-v] [-r RATE] [-t TOPIC] [-o OFILE] [--save_images] [--frames FRAMES] rosbag [rosbag ...]
 
 Convert ROS bag (1/2) to video using ffmpeg.
 
 positional arguments:
-  rosbag                Input File
+  rosbag                Input File(s)
 
 options:
   -h, --help            show this help message and exit
@@ -94,7 +115,16 @@ docker run -it --rm \
 source /opt/ros/humble/setup.bash
 ```
 
+Example: extract all image topics form one ore more rosbag2 directories or bags
+
+```bash
+python3 rosbag2video.py <bag_folder_name>
+# Eg. python3 rosbag2video.py rosbag2_2024_10_11-19_45_28 -o myvideo.mp4
+```
+
+Example: extract a specific topic
+
 ```bash
 python3 rosbag2video.py -t <topic_name> -o <output_video_file_name> <bag_folder_name>
-# Eg. python3 rosbag2video.py -t /cam0/image_raw -i rosbag2_2024_10_11-19_45_28 -o myvideo.mp4
+# Eg. python3 rosbag2video.py -t /cam0/image_raw -o myvideo.mp4 rosbag2_2024_10_11-19_45_28
 ```

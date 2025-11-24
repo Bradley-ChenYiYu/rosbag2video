@@ -5,7 +5,7 @@ sqlite3 extraction from .db3 files and metadata.yaml
 """
 # -*- coding: utf-8 -*-
 #
-# Copyright (c) 2024 Bey Hao Yun.
+# Copyright (c) 2025 Maximilian Laiacker.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -354,13 +354,20 @@ def export_all_image_topics(
             if (
                 msg_type.endswith("CompressedImage")
                 and not args.save_images
-                and msg_encoding in ("jpeg", "jpg")
+                and ("jpeg" in msg_encoding.lower() or "jpg" in msg_encoding.lower())
             ):
+                if IS_VERBOSE:
+                    try:
+                        print(f"{c.topic} msg_type: {msg_type} msg_encoding: {msg_encoding}")
+                    except:
+                        pass
                 ofile = bag_path / (c.topic.replace("/","_")+".mp4")
                 if(not ofile.exists()):
                     print(f"exporting {c.topic} to file {ofile}" )
                     # we can directly feed the jpg data to ffmpeg to create the video
                     create_video_from_jpg(reader, conn, str(ofile), args.rate)
+
+            
 
 
 if __name__ == "__main__":
@@ -381,7 +388,7 @@ if __name__ == "__main__":
                         help="Boolean flag for saving extracted .png frames in frames/")
     parser.add_argument("--frames", type=int, required=False, default=-1,
                         help="Limit the number of frames to export")
-    parser.add_argument('rosbag',type=str, help="Input File", nargs="+")
+    parser.add_argument('rosbag',type=str, help="Input Bag(s)", nargs="+")
     args = parser.parse_args(sys.argv[1:])
 
     IS_VERBOSE = args.verbose
