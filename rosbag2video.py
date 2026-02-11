@@ -27,15 +27,25 @@ import shutil
 from pathlib import Path
 from typing import Tuple
 
-import cv2
 
 try:
+    import cv2
     from cv_bridge import CvBridge
 except ModuleNotFoundError:
     print("cv_bridge module not found")
-from rosbags.highlevel import AnyReader
-from rosbags.interfaces import Connection
-
+try:
+    from rosbags.highlevel import AnyReader
+    from rosbags.interfaces import Connection
+except ModuleNotFoundError:
+    print("rosbags module not found")
+    #try to run pip to install it
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "rosbags"])
+        from rosbags.highlevel import AnyReader
+        from rosbags.interfaces import Connection
+    except Exception as e:
+        print("Failed to install rosbags module:", e)
+        sys.exit(1)
 
 IS_VERBOSE = False
 
