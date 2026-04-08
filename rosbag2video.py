@@ -25,17 +25,21 @@ import subprocess
 import argparse
 import shutil
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Optional, Tuple
+
+import numpy as np
 
 
 try:
     import cv2
-    from cv_bridge import CvBridge
-except ModuleNotFoundError:
-    print("cv_bridge module not found")
+except Exception as exc:
+    print("cv2 module not found or failed to import:", exc)
+    cv2 = None
+
 try:
     from rosbags.highlevel import AnyReader
     from rosbags.interfaces import Connection
+    from rosbags.typesys import Stores, get_typestore
 except ModuleNotFoundError:
     print("rosbags module not found")
     #try to run pip to install it
@@ -43,70 +47,18 @@ except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "rosbags"])
         from rosbags.highlevel import AnyReader
         from rosbags.interfaces import Connection
+        from rosbags.typesys import Stores, get_typestore
     except Exception as e:
         print("Failed to install rosbags module:", e)
         sys.exit(1)
 
+
+DEFAULT_TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
+
 IS_VERBOSE = False
 
 
-def get_pix_fmt(msg_encoding: str) -> str:
-    """
-    Determine pixel format based on message encoding.
-
-    Args:
-        msg_encoding (str): The encoding of the message.
-
-    Returns:
-        str: The determined pixel format.
-
-    Notes:
-        This function attempts to infer the correct pixel format from a given
-        message encoding. It supports various formats, including gray, bgra,
-        and RGB variants. If an unsupported encoding is provided, it defaults
-        to yuv420p or prints warnings accordingly.
-
-    Raises:
-        AttributeError: If msg_encoding cannot be handled.
-    """
-    pix_fmt = "yuv420p"
-
-    if IS_VERBOSE:
-        print("[INFO] - AJB: Encoding:", msg_encoding)
-
-    try:
-        if msg_encoding.find("mono8") != -1:
-            pix_fmt = "gray"
-        elif msg_encoding.find("8UC1") != -1:
-            pix_fmt = "gray"
-        elif msg_encoding.find("bgra") != -1:
-            pix_fmt = "bgra"
-        elif msg_encoding.find("bgr8") != -1:
-            pix_fmt = "bgr24"
-        elif msg_encoding.find("bggr8") != -1:
-            pix_fmt = "bayer_bggr8"
-        elif msg_encoding.find("rggb8") != -1:
-            pix_fmt = "bayer_rggb8"
-        elif msg_encoding.find("rgb8") != -1:
-            pix_fmt = "rgb24"
-        elif msg_encoding.find("16UC1") != -1:
-            pix_fmt = "gray16le"
-        else:
-            print(f"[WARN] - Unsupported encoding: {msg_encoding}. "
-                  "Defaulting pix_fmt to {pix_fmt}...")
-    except AttributeError:
-        # Maybe this is a theora packet which is unsupported.
-        print(
-            "[ERROR] - Could not handle this format."
-            + " Maybe thoera packet? theora is not supported."
-        )
-        return ""
-    if IS_VERBOSE:
-        print("[INFO] - pix_fmt:", pix_fmt)
-    return pix_fmt
-
-
-def get_topic_info(reader: AnyReader, topic_name: str) -> Tuple[int, str, int]:
+def get_topic_info(reader: AnyReader, topic_name: str) -> Tuple[int, str, Connection]:
     """Return (message_count, msg_type, connection) for *topic_name*."""
     conn = next((c for c in reader.connections if c.topic == topic_name), None)
     if conn is None:
@@ -123,58 +75,88 @@ def get_msg_format_from_rosbag(reader: AnyReader, connection: Connection) -> str
     msg = reader.deserialize(raw, connection.msgtype)
     return getattr(msg, "format", getattr(msg, "encoding", "")), msg
 
-try:
-# this needs cv_bridge
-# the rest will not need it so we can still extract using ffmpeg
-    def save_image_from_rosbag(
-        cvbridge: CvBridge,
-        reader: AnyReader,
-        connection: Connection,
-        input_msg_type: str,
-        message_index: int = 0,
-    ) -> None:
-        """
-        Save an image from a ROS bag.
+def decode_ros_image_message(msg, input_msg_type: str):
+    """Convert a ROS image message into an OpenCV image array."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required to decode ROS image messages.")
 
-        Args:
-            cvbridge: CvBridge instance for converting between OpenCV and ROS images.
-            reader: Rosbag reader.
-            connection: connection containing the image messages.
-            input_msg_type: The type of message in the topic, e.g. "sensor_msgs/msg/Image".
-            message_index (optional): The index of the message to save. Defaults to 0.
+    if input_msg_type.endswith("CompressedImage"):
+        buffer = np.frombuffer(msg.data, dtype=np.uint8)
+        image = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError("Failed to decode compressed image message.")
+        return image
 
-        Returns:
-            None
+    encoding = getattr(msg, "encoding", "").lower()
+    height = int(getattr(msg, "height", 0))
+    width = int(getattr(msg, "width", 0))
+    step = int(getattr(msg, "step", 0))
 
-        Raises:
-            Exception: If an error occurs during image conversion or saving.
+    encoding_map = {
+        "mono8": (np.uint8, 1),
+        "8uc1": (np.uint8, 1),
+        "bgr8": (np.uint8, 3),
+        "rgb8": (np.uint8, 3),
+        "bgra8": (np.uint8, 4),
+        "16uc1": (np.uint16, 1),
+    }
+    if encoding not in encoding_map:
+        raise ValueError(f"Unsupported image encoding without cv_bridge: {encoding}")
 
-        Notes:
-            This function queries a ROS 2 database for messages in a specified topic,
-            deserializes them into OpenCV images, and saves them as PNG files.
-        """
-        for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
+    dtype, channels = encoding_map[encoding]
+    itemsize = np.dtype(dtype).itemsize
+    row_width = step // itemsize if step else width * channels
+    image = np.frombuffer(msg.data, dtype=dtype).reshape(height, row_width)
+    image = image[:, : width * channels]
+    if channels == 1:
+        return image.reshape(height, width)
 
-            print(f"[INFO] - Extracting [{i+1}/{message_count}] …", end="\r")
-            sys.stdout.flush()
+    image = image.reshape(height, width, channels)
+    if encoding == "rgb8":
+        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    if encoding == "bgra8":
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    return image
 
-            msg = reader.deserialize(raw, connection.msgtype)
-            image_file_type = ".jpg" if getattr(msg, "format", "").lower() == "jpeg" else ".png"
 
-            if input_msg_type.endswith("CompressedImage"):
-                cv_image = cvbridge.compressed_imgmsg_to_cv2(msg, desired_encoding="passthrough")
-            else:
-                cv_image = cvbridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+def save_image_from_rosbag(
+    reader: AnyReader,
+    connection: Connection,
+    input_msg_type: str,
+    message_count: int,
+) -> None:
+    """
+    Save an image from a ROS bag.
 
-            padded_number = f"{i:07d}"
-            output_filename = f"frames/{padded_number}{image_file_type}"
-            cv2.imwrite(output_filename, cv_image)
-            
-        else:
-            print(f"[ERROR] - No message at index {message_index} for topic {conn.topic}")
+    Args:
+        reader: Rosbag reader.
+        connection: connection containing the image messages.
+        input_msg_type: The type of message in the topic, e.g. "sensor_msgs/msg/Image".
+        message_count: Total number of messages in the topic.
 
-except:
-    pass
+    Returns:
+        None
+
+    Raises:
+        Exception: If an error occurs during image conversion or saving.
+
+    Notes:
+        This function queries a ROS 2 database for messages in a specified topic,
+        deserializes them into OpenCV images, and saves them as PNG files.
+    """
+    for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
+
+        print(f"[INFO] - Extracting [{i+1}/{message_count}] …", end="\r")
+        sys.stdout.flush()
+
+        msg = reader.deserialize(raw, connection.msgtype)
+        image_file_type = ".jpg" if getattr(msg, "format", "").lower() == "jpeg" else ".png"
+        cv_image = decode_ros_image_message(msg, input_msg_type)
+
+        padded_number = f"{i:07d}"
+        output_filename = f"frames/{padded_number}{image_file_type}"
+        cv2.imwrite(output_filename, cv_image)
+
 
 def check_and_create_folder(folder_path: str) -> None:
     """
@@ -269,6 +251,8 @@ def create_video_from_images(image_folder: str, output_video: str, pix_fmt: str,
         "-loglevel",
         "error" if not IS_VERBOSE else "info",
         "-stats",
+        "-threads",
+        "1",
         "-r",
         str(framerate),  # Set frame rate
         "-f",
@@ -329,6 +313,8 @@ def create_video_from_jpg(
         "-loglevel",
         "error" if not IS_VERBOSE else "info",
         "-stats",
+        "-threads",
+        "1",
         "-r",
         str(fps),
         "-f",
@@ -343,32 +329,109 @@ def create_video_from_jpg(
     ]
     create_video_ffmpeg(cmd, reader, connection, output_video, max_frames)
 
+
+def create_video_from_raw_image(
+    reader: AnyReader,
+    connection: Connection,
+    output_video: str,
+    fps: float,
+    max_frames: int = -1,
+):
+    """Write raw ROS image messages to an MP4 file using OpenCV."""
+    if cv2 is None:
+        print("[ERROR] - OpenCV is required for raw image export.")
+        return False
+
+    writer = None
+    frame_count = 0
+    target_size = None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
+        if 0 < max_frames <= i:
+            break
+
+        msg = reader.deserialize(raw, connection.msgtype)
+        frame = decode_ros_image_message(msg, "sensor_msgs/msg/Image")
+
+        # Normalize to 8-bit BGR for stable encoding.
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        if frame.dtype != np.uint8:
+            if frame.dtype == np.uint16:
+                frame = cv2.convertScaleAbs(frame, alpha=255.0 / 65535.0)
+            else:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        if writer is None:
+            height, width = frame.shape[:2]
+            target_size = (width, height)
+            writer = cv2.VideoWriter(output_video, fourcc, fps, target_size)
+            if not writer.isOpened():
+                print(f"[ERROR] - Could not open VideoWriter for {output_video}.")
+                return False
+
+        if frame.shape[1] != target_size[0] or frame.shape[0] != target_size[1]:
+            frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
+
+        writer.write(frame)
+        frame_count += 1
+
+    if writer is not None:
+        writer.release()
+
+    if frame_count == 0:
+        print("[ERROR] - No frames written for raw image topic.")
+        return False
+
+    print(f"[INFO] - Video written to {output_video}.")
+    return True
+
 def create_video_ffmpeg(
-    cmd: str,
+    cmd: list[str],
     reader: AnyReader,
     connection: Connection,
     output_video: str,
     max_frames: int = -1,
-):
+    frame_serializer: Optional[Callable] = None,
+) -> bool:
     if IS_VERBOSE:
         print("[INFO] -", " ".join(cmd))
-    ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if frame_serializer is None:
+        frame_serializer = lambda msg: msg.data
 
     for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
         if 0 < max_frames <= i:
             break
         msg = reader.deserialize(raw, connection.msgtype)
-        ffmpeg.stdin.write(msg.data)  # raw from rosbag
+        try:
+            ffmpeg.stdin.write(frame_serializer(msg))
+        except BrokenPipeError:
+            stderr_output = ffmpeg.stderr.read().decode("utf-8", errors="replace")
+            print(f"[ERROR] - ffmpeg terminated early while writing frames.\n{stderr_output}")
+            return False
+
     ffmpeg.stdin.close()
-    ffmpeg.wait()
+    return_code = ffmpeg.wait()
+    if return_code != 0:
+        stderr_output = ffmpeg.stderr.read().decode("utf-8", errors="replace")
+        print(f"[ERROR] - ffmpeg exited with code {return_code}.\n{stderr_output}")
+        return False
+
     print(f"[INFO] - Video written to {output_video}.")
+    return True
 
 def export_all_image_topics(       
     bag_path: Path,
     args:argparse.ArgumentParser
 ):
     # Process the bag
-    with AnyReader([bag_path]) as reader:
+    with AnyReader([bag_path], default_typestore=DEFAULT_TYPESTORE) as reader:
         for c in reader.connections:
             message_count, msg_type, conn = get_topic_info(reader, c.topic)
             msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
@@ -395,26 +458,14 @@ def export_all_image_topics(
                 and msg_encoding != ""
             ):
                 try:
-                    size = str(msg.width)+"x"+str(msg.height)
-                    pix_fmt = get_pix_fmt(msg_encoding)
-                    cmd = [
-                        "ffmpeg",
-                        "-loglevel",
-                        "error" if not IS_VERBOSE else "info",
-                        "-stats",
-                        "-r",
-                        str(args.rate),
-                        "-f", "rawvideo",
-                        "-s", size,
-                        "-pix_fmt", pix_fmt,
-                        "-i", "-",  # stdin
-                        "-c:v", "mjpeg",
-                        "-an",
-                        str(ofile),
-                        "-y",
-                    ]
                     print(f"exporting {c.topic} to file {ofile}" )
-                    create_video_ffmpeg(cmd, reader, conn, str(ofile))
+                    create_video_from_raw_image(
+                        reader,
+                        conn,
+                        str(ofile),
+                        args.rate,
+                        args.frames,
+                    )
                 except Exception as e:
                     print(f"failed exporting {c.topic} to file {ofile} with error:", e )
 
@@ -465,7 +516,7 @@ if __name__ == "__main__":
         if not bag_path.exists():
             sys.exit(f"[ERROR] - Path '{bag_path}' does not exist.")
         # Process the bag
-        with AnyReader([bag_path]) as reader:
+        with AnyReader([bag_path], default_typestore=DEFAULT_TYPESTORE) as reader:
             message_count, msg_type, conn = get_topic_info(reader, args.topic)
 
             msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
@@ -476,16 +527,30 @@ if __name__ == "__main__":
             ):
                 # we can directly feed the jpg data to ffmpeg to create the video
                 create_video_from_jpg(reader, conn, args.ofile, args.rate, args.frames)
+            elif (
+                msg_type.endswith("sensor_msgs/msg/Image")
+                and not args.save_images
+                and msg is not None
+                and msg_encoding != ""
+            ):
+                # Stream raw frames directly from bag to ffmpeg to avoid the heavy concat path.
+                if not create_video_from_raw_image(
+                    reader,
+                    conn,
+                    args.ofile,
+                    args.rate,
+                    args.frames,
+                ):
+                    print("[ERROR] - Could not generate video.")
             else:
                 # else do the image export stuff - extract frames, then ffmpeg concat
                 FRAMES_FOLDER = "frames"
                 check_and_create_folder(FRAMES_FOLDER)
                 clear_folder_if_non_empty(FRAMES_FOLDER)
 
-                bridge = CvBridge()
-                save_image_from_rosbag(bridge, reader, conn, msg_type)
+                save_image_from_rosbag(reader, conn, msg_type, message_count)
                 # Construct video from image sequence
-                pix_fmt = get_pix_fmt(msg_encoding)
+                pix_fmt = "yuv420p"
                 if not create_video_from_images(FRAMES_FOLDER, args.ofile, pix_fmt, framerate=args.rate):
                     print("[ERROR] - Could not generate video.")
 
