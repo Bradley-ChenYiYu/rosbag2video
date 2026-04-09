@@ -2,6 +2,8 @@
 """
 Module to generate video output given ROS 2 bag folders via direct
 sqlite3 extraction from .db3 files and metadata.yaml
+e.g. python3 ros2_ws/src/rosbag2video/rosbag2video.py -v -t /camera/camera/color/image_raw
+     -o {VIDEO_NAME}.mp4 {BAG_FOLDER}
 """
 # -*- coding: utf-8 -*-
 #
