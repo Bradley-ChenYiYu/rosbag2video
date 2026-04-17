@@ -60,6 +60,74 @@ DEFAULT_TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 IS_VERBOSE = False
 
 
+def get_ffmpeg_executable() -> Optional[str]:
+    """Return an ffmpeg executable path if available.
+
+    Preference order:
+    1) System ffmpeg on PATH
+    2) Bundled binary from imageio-ffmpeg (if installed)
+    """
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        return ffmpeg_bin
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_bin and Path(ffmpeg_bin).exists():
+            return ffmpeg_bin
+    except Exception:
+        pass
+
+    return None
+
+
+def is_rosbag_path(p: Path) -> bool:
+    """Return True if Path *p* looks like a ROS2 bag (file or directory).
+
+    Heuristics: contains metadata.yaml, contains any .db3/.db files or name startswith 'rosbag2'.
+    """
+    try:
+        if not p.exists():
+            return False
+        if p.is_file():
+            return p.suffix in (".db3", ".db", ".bag")
+        # directory heuristics
+        if (p / "metadata.yaml").exists():
+            return True
+        for f in p.iterdir():
+            if f.is_file() and f.suffix in (".db3", ".db"):
+                return True
+        if p.name.startswith("rosbag2"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def find_bag_paths(path: Path) -> list[Path]:
+    """Given a path, return a list of bag paths.
+
+    - If *path* itself looks like a bag, return [path].
+    - If *path* is a parent directory, return its child paths that look like bags.
+    - If none found, fall back to returning [path] (with a warning).
+    """
+    path = path.expanduser().resolve()
+    if is_rosbag_path(path):
+        return [path]
+    if path.is_dir():
+        candidates = []
+        for child in sorted(path.iterdir()):
+            if is_rosbag_path(child):
+                candidates.append(child)
+        if candidates:
+            return candidates
+        print(f"[WARN] - No rosbag directories found inside {path}; treating as single bag.")
+        return [path]
+    return []
+
+
 def get_topic_info(reader: AnyReader, topic_name: str) -> Tuple[int, str, Connection]:
     """Return (message_count, msg_type, connection) for *topic_name*."""
     conn = next((c for c in reader.connections if c.topic == topic_name), None)
@@ -126,6 +194,7 @@ def save_image_from_rosbag(
     connection: Connection,
     input_msg_type: str,
     message_count: int,
+    frames_folder: str = "frames",
 ) -> None:
     """
     Save an image from a ROS bag.
@@ -156,7 +225,7 @@ def save_image_from_rosbag(
         cv_image = decode_ros_image_message(msg, input_msg_type)
 
         padded_number = f"{i:07d}"
-        output_filename = f"frames/{padded_number}{image_file_type}"
+        output_filename = os.path.join(frames_folder, f"{padded_number}{image_file_type}")
         cv2.imwrite(output_filename, cv_image)
 
 
@@ -247,9 +316,15 @@ def create_video_from_images(image_folder: str, output_video: str, pix_fmt: str,
         for path in images:
             f.write(f"file '{path}'\n")
 
+    ffmpeg_bin = get_ffmpeg_executable()
+    if ffmpeg_bin is None:
+        print("[ERROR] - ffmpeg not found. Install ffmpeg or `uv add imageio-ffmpeg`.")
+        os.remove(image_list_file)
+        return False
+
     # Build the ffmpeg command
     command = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-loglevel",
         "error" if not IS_VERBOSE else "info",
         "-stats",
@@ -310,8 +385,13 @@ def create_video_from_jpg(
     Notes:
 
     """
+    ffmpeg_bin = get_ffmpeg_executable()
+    if ffmpeg_bin is None:
+        print("[ERROR] - ffmpeg not found. Install ffmpeg or `uv add imageio-ffmpeg`.")
+        return False
+
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-loglevel",
         "error" if not IS_VERBOSE else "info",
         "-stats",
@@ -329,7 +409,7 @@ def create_video_from_jpg(
         output_video,
         "-y",
     ]
-    create_video_ffmpeg(cmd, reader, connection, output_video, max_frames)
+    return create_video_ffmpeg(cmd, reader, connection, output_video, max_frames)
 
 
 def create_video_from_raw_image(
@@ -339,15 +419,21 @@ def create_video_from_raw_image(
     fps: float,
     max_frames: int = -1,
 ):
-    """Write raw ROS image messages to an MP4 file using OpenCV."""
+    """Write raw ROS image messages to an MP4 file using ffmpeg over stdin.
+
+    This avoids OpenCV VideoWriter backend issues (missing codec/container support).
+    """
     if cv2 is None:
         print("[ERROR] - OpenCV is required for raw image export.")
         return False
 
-    writer = None
+    ffmpeg = None
+    ffmpeg_bin = get_ffmpeg_executable()
+    use_ffmpeg = ffmpeg_bin is not None
     frame_count = 0
     target_size = None
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = None
+    writer_output = output_video
 
     for i, (conn, ts, raw) in enumerate(reader.messages(connections=[connection])):
         if 0 < max_frames <= i:
@@ -368,20 +454,87 @@ def create_video_from_raw_image(
             else:
                 frame = np.clip(frame, 0, 255).astype(np.uint8)
 
-        if writer is None:
+        if ffmpeg is None and writer is None:
             height, width = frame.shape[:2]
             target_size = (width, height)
-            writer = cv2.VideoWriter(output_video, fourcc, fps, target_size)
-            if not writer.isOpened():
-                print(f"[ERROR] - Could not open VideoWriter for {output_video}.")
-                return False
+            if use_ffmpeg:
+                cmd = [
+                    ffmpeg_bin,
+                    "-loglevel",
+                    "error" if not IS_VERBOSE else "info",
+                    "-stats",
+                    "-threads",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pixel_format",
+                    "bgr24",
+                    "-video_size",
+                    f"{width}x{height}",
+                    "-framerate",
+                    str(fps),
+                    "-i",
+                    "-",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    output_video,
+                    "-y",
+                ]
+                if IS_VERBOSE:
+                    print("[INFO] -", " ".join(cmd))
+                ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            else:
+                print("[WARN] - ffmpeg not found. Falling back to OpenCV VideoWriter codecs.")
+                codec_candidates = [
+                    ("mp4v", output_video),
+                    ("avc1", output_video),
+                    ("XVID", str(Path(output_video).with_suffix(".avi"))),
+                    ("MJPG", str(Path(output_video).with_suffix(".avi"))),
+                ]
+                for fourcc_str, candidate_path in codec_candidates:
+                    candidate_writer = cv2.VideoWriter(
+                        candidate_path,
+                        cv2.VideoWriter_fourcc(*fourcc_str),
+                        fps,
+                        target_size,
+                    )
+                    if candidate_writer.isOpened():
+                        writer = candidate_writer
+                        writer_output = candidate_path
+                        if candidate_path != output_video:
+                            print(f"[WARN] - Using fallback output path: {writer_output}")
+                        break
+                    candidate_writer.release()
+
+                if writer is None:
+                    print(f"[ERROR] - Could not open any VideoWriter codec for {output_video}.")
+                    return False
 
         if frame.shape[1] != target_size[0] or frame.shape[0] != target_size[1]:
             frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
 
-        writer.write(frame)
+        frame = np.ascontiguousarray(frame)
+        if ffmpeg is not None:
+            try:
+                ffmpeg.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                stderr_output = ffmpeg.stderr.read().decode("utf-8", errors="replace")
+                print(f"[ERROR] - ffmpeg terminated early while writing raw frames.\n{stderr_output}")
+                return False
+        else:
+            writer.write(frame)
+
         frame_count += 1
 
+    if ffmpeg is not None:
+        ffmpeg.stdin.close()
+        return_code = ffmpeg.wait()
+        if return_code != 0:
+            stderr_output = ffmpeg.stderr.read().decode("utf-8", errors="replace")
+            print(f"[ERROR] - ffmpeg exited with code {return_code}.\n{stderr_output}")
+            return False
     if writer is not None:
         writer.release()
 
@@ -389,7 +542,7 @@ def create_video_from_raw_image(
         print("[ERROR] - No frames written for raw image topic.")
         return False
 
-    print(f"[INFO] - Video written to {output_video}.")
+    print(f"[INFO] - Video written to {writer_output if writer is not None else output_video}.")
     return True
 
 def create_video_ffmpeg(
@@ -502,61 +655,79 @@ if __name__ == "__main__":
 
     # Check if bag exists
 
-    if(not args.topic):
-        for bag in args.rosbag :
-            if IS_VERBOSE :
-                print(f"extracting from rosbag: {bag}")
+    if not args.topic:
+        for bag in args.rosbag:
             try:
-                bag_path = Path(bag).expanduser().resolve()
-                export_all_image_topics(bag_path, args)
+                bag_root = Path(bag).expanduser().resolve()
             except Exception as e:
                 print(e)
+                continue
+
+            bag_paths = find_bag_paths(bag_root)
+            for bag_path in bag_paths:
+                if IS_VERBOSE:
+                    print(f"extracting from rosbag: {bag_path}")
+                try:
+                    export_all_image_topics(bag_path, args)
+                except Exception as e:
+                    print(e)
         exit(0)
 
-    for bag in args.rosbag :
-        bag_path = Path(bag).expanduser().resolve()
-        if not bag_path.exists():
-            sys.exit(f"[ERROR] - Path '{bag_path}' does not exist.")
-        # Process the bag
-        with AnyReader([bag_path], default_typestore=DEFAULT_TYPESTORE) as reader:
-            message_count, msg_type, conn = get_topic_info(reader, args.topic)
+    out_basename = Path(args.ofile).name
+    for bag in args.rosbag:
+        bag_root = Path(bag).expanduser().resolve()
+        bag_paths = find_bag_paths(bag_root)
+        for bag_path in bag_paths:
+            if not bag_path.exists():
+                print(f"[ERROR] - Path '{bag_path}' does not exist.")
+                continue
 
-            msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
-            if (
-                msg_type.endswith("CompressedImage")
-                and not args.save_images
-                and msg_encoding in ("jpeg", "jpg")
-            ):
-                # we can directly feed the jpg data to ffmpeg to create the video
-                create_video_from_jpg(reader, conn, args.ofile, args.rate, args.frames)
-            elif (
-                msg_type.endswith("sensor_msgs/msg/Image")
-                and not args.save_images
-                and msg is not None
-                and msg_encoding != ""
-            ):
-                # Stream raw frames directly from bag to ffmpeg to avoid the heavy concat path.
-                if not create_video_from_raw_image(
-                    reader,
-                    conn,
-                    args.ofile,
-                    args.rate,
-                    args.frames,
-                ):
-                    print("[ERROR] - Could not generate video.")
+            # determine output file for this bag (place inside bag directory)
+            if bag_path.is_dir():
+                target_ofile = bag_path / out_basename
             else:
-                # else do the image export stuff - extract frames, then ffmpeg concat
-                FRAMES_FOLDER = "frames"
-                check_and_create_folder(FRAMES_FOLDER)
-                clear_folder_if_non_empty(FRAMES_FOLDER)
+                target_ofile = bag_path.with_name(out_basename)
 
-                save_image_from_rosbag(reader, conn, msg_type, message_count)
-                # Construct video from image sequence
-                pix_fmt = "yuv420p"
-                if not create_video_from_images(FRAMES_FOLDER, args.ofile, pix_fmt, framerate=args.rate):
-                    print("[ERROR] - Could not generate video.")
+            # Process the bag
+            with AnyReader([bag_path], default_typestore=DEFAULT_TYPESTORE) as reader:
+                message_count, msg_type, conn = get_topic_info(reader, args.topic)
 
-                # Keep or remove frames folder content based on --save-images flag.
-                if not args.save_images:
+                msg_encoding, msg = get_msg_format_from_rosbag(reader, conn)
+                if (
+                    msg_type.endswith("CompressedImage")
+                    and not args.save_images
+                    and msg_encoding in ("jpeg", "jpg")
+                ):
+                    # we can directly feed the jpg data to ffmpeg to create the video
+                    create_video_from_jpg(reader, conn, str(target_ofile), args.rate, args.frames)
+                elif (
+                    msg_type.endswith("sensor_msgs/msg/Image")
+                    and not args.save_images
+                    and msg is not None
+                    and msg_encoding != ""
+                ):
+                    # Stream raw frames directly from bag to ffmpeg to avoid the heavy concat path.
+                    if not create_video_from_raw_image(
+                        reader,
+                        conn,
+                        str(target_ofile),
+                        args.rate,
+                        args.frames,
+                    ):
+                        print("[ERROR] - Could not generate video.")
+                else:
+                    # else do the image export stuff - extract frames, then ffmpeg concat
+                    FRAMES_FOLDER = str(bag_path / "frames")
+                    check_and_create_folder(FRAMES_FOLDER)
                     clear_folder_if_non_empty(FRAMES_FOLDER)
+
+                    save_image_from_rosbag(reader, conn, msg_type, message_count, frames_folder=FRAMES_FOLDER)
+                    # Construct video from image sequence
+                    pix_fmt = "yuv420p"
+                    if not create_video_from_images(FRAMES_FOLDER, str(target_ofile), pix_fmt, framerate=args.rate):
+                        print("[ERROR] - Could not generate video.")
+
+                    # Keep or remove frames folder content based on --save-images flag.
+                    if not args.save_images:
+                        clear_folder_if_non_empty(FRAMES_FOLDER)
 
